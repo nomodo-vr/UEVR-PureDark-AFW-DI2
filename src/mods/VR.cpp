@@ -25,6 +25,17 @@
 
 #include "VR.hpp"
 #include <safetyhook.hpp>
+#include "render/DI2VelocityCanonicalizer.hpp"
+
+namespace {
+bool is_dead_island_2_executable() {
+    static const bool detected = [] {
+        const auto path = utility::get_module_pathw(utility::get_executable());
+        return path && path->find(L"DeadIsland-Win64-Shipping") != std::wstring::npos;
+    }();
+    return detected;
+}
+}
 
 NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_CreateFeature(
     ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID, NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle) {
@@ -116,6 +127,29 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
                 vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 vr->d3d12Renderer->SetupTextureDesc(vr->rawMVDesc[nEye]);
             }
+            if (vr->rawVelocityNeedsExpansion[nEye] && vr->rawVelocityRGDesc[nEye].pTexture) {
+                const auto desc = vr->rawVelocityRGDesc[nEye].pTexture->GetDesc();
+                auto& expanded = vr->rawVelocityDesc[nEye];
+                if (expanded.pTexture == nullptr || expanded.pTexture->GetDesc().Width != desc.Width ||
+                    expanded.pTexture->GetDesc().Height != desc.Height ||
+                    expanded.pTexture->GetDesc().Format != DXGI_FORMAT_R16G16B16A16_UNORM) {
+                    vr->d3d12Renderer->CreateTexture(desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_UNORM,
+                        D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, expanded, true);
+                }
+                if (expanded.pTexture != nullptr) {
+                    static DI2VelocityCanonicalizer canonicalizer;
+                    const bool normalize = is_dead_island_2_executable() && vr->is_di2_canonical_velocity_enabled();
+                    if (normalize && canonicalizer.convert(InCmdList, vr->d3d12Renderer, vr->rawVelocityRGDesc[nEye], expanded)) {
+                        SPDLOG_INFO_ONCE("[DeadIsland2][Velocity] Canonicalized linear RG16 velocity before object-motion correction");
+                    } else {
+                        const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(desc.Width),
+                            static_cast<float>(desc.Height), 0.0f, 1.0f};
+                        if (normalize) SPDLOG_WARN_ONCE("[DeadIsland2][Velocity] Canonicalization unavailable; using RG16 expansion fallback");
+                        vr->d3d12Renderer->Blit(InCmdList, expanded, vr->rawVelocityRGDesc[nEye], viewport, NoBlend, true);
+                    }
+                    SPDLOG_INFO_ONCE("[AFW][Velocity] Expanded RG16 velocity to RGBA16 with zero packed depth motion");
+                }
+            }
             if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() && 
                 vr->rawVelocityDesc[nEye].pTexture && vr->rawVelocityDesc[nEyeOther].pTexture) {
                 if (vr->rawMVDesc[nEye].pTexture && vr->motionVectorsDesc[nEye].pTexture) {
@@ -185,6 +219,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
     static int lastRHISubmissionThreadFoundFrame = 0;
 
     ID3D12Resource* velocityCandidate = nullptr;
+    D3D12_RESOURCE_STATES velocityCandidateState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     ID3D12Resource* motionVectorsCandidate = nullptr;
     auto render_frame_count = vr->get_render_frame_count();
     EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
@@ -193,6 +228,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
         auto& barrier = pBarriers[i];
         if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !barrier.Transition.pResource || 
             vr->rawVelocityDesc[nEye].pTexture == barrier.Transition.pResource ||
+            vr->rawVelocityRGDesc[nEye].pTexture == barrier.Transition.pResource ||
             vr->rawMVDesc[nEye].pTexture == barrier.Transition.pResource)
             continue;
         auto desc = barrier.Transition.pResource->GetDesc();
@@ -204,6 +240,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
                 if ((desc.Width == vr->renderSize[0] || vr->renderSize[0] == 0) &&
                     (desc.Height == vr->renderSize[1] || vr->renderSize[1] == 0)) {
                     velocityCandidate = barrier.Transition.pResource;
+                    velocityCandidateState = barrier.Transition.StateAfter;
                 }
             }
         } else if (isNeverDLSS && desc.Format == DXGI_FORMAT_R16G16_FLOAT) {
@@ -232,21 +269,36 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
             if (velocityCandidate && vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
                 (render_frame_count - vr->last_dlss_frame_count) <= 1) {
                 auto desc = velocityCandidate->GetDesc();
-                if (vr->rawVelocityDesc[nEye].pTexture == NULL || vr->rawVelocityDesc[nEye].pTexture->GetDesc().Width != desc.Width ||
-                    vr->rawVelocityDesc[nEye].pTexture->GetDesc().Height != desc.Height) {
+                const bool expand_velocity = desc.Format == DXGI_FORMAT_R16G16_UNORM;
+                auto& captured = expand_velocity ? vr->rawVelocityRGDesc[nEye] : vr->rawVelocityDesc[nEye];
+                if (captured.pTexture == NULL || captured.pTexture->GetDesc().Width != desc.Width ||
+                    captured.pTexture->GetDesc().Height != desc.Height || captured.pTexture->GetDesc().Format != desc.Format) {
                     vr->d3d12Renderer->CreateTexture(
-                        desc.Width, desc.Height, desc.Format, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->rawVelocityDesc[nEye], true);
+                        desc.Width, desc.Height, desc.Format, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, captured, !expand_velocity);
+                    if (expand_velocity && captured.pTexture != nullptr) {
+                        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                        srv.Format = desc.Format;
+                        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        srv.Texture2D.MipLevels = 1;
+                        srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+                            0, 1, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+                            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+                        vr->d3d12Renderer->GetDevice()->CreateShaderResourceView(captured.pTexture, &srv,
+                            vr->d3d12Renderer->GetCPUDescriptorHandle(captured.srvPos));
+                    }
                 }
                 static std::map<ID3D12Resource*, TextureDesc> rawVelocityDescMap;
                 if (!rawVelocityDescMap.contains(velocityCandidate)) {
                     rawVelocityDescMap[velocityCandidate].pTexture = velocityCandidate;
-                    rawVelocityDescMap[velocityCandidate].initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    rawVelocityDescMap[velocityCandidate].initialState = velocityCandidateState;
                     vr->d3d12Renderer->SetupTextureDesc(rawVelocityDescMap[velocityCandidate]);
                     // velocityCandidate->SetName(L"VelocityBuffer");
                 }
+                rawVelocityDescMap[velocityCandidate].initialState = velocityCandidateState;
                 skip = true;
-                vr->d3d12Renderer->Copy(This, vr->rawVelocityDesc[nEye], rawVelocityDescMap[velocityCandidate]);
+                vr->d3d12Renderer->Copy(This, captured, rawVelocityDescMap[velocityCandidate]);
                 skip = false;
+                vr->rawVelocityNeedsExpansion[nEye] = expand_velocity;
             }
             if (motionVectorsCandidate) {
                 auto desc = motionVectorsCandidate->GetDesc();

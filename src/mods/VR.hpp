@@ -39,6 +39,8 @@ public:
     TextureDesc rawMVDesc[2];
 
     TextureDesc rawVelocityDesc[2]{{}, {}};
+    TextureDesc rawVelocityRGDesc[2]{{}, {}};
+    bool rawVelocityNeedsExpansion[2]{false, false};
 
     TextureDesc uiBufferDesc{};
     TextureDesc depthDesc[2]{{}, {}};
@@ -82,6 +84,7 @@ public:
     float get_sharpness() { return m_sharpness->value(); };
 
     float get_ignore_motion_threshold() { return m_ignore_motion_threshold->value(); };
+    bool is_di2_canonical_velocity_enabled() const { return m_di2_canonical_velocity->value(); }
 
     bool is_use_uint64() { return m_use_uint64->value(); };
     bool is_fix_object_motion_vector() { return m_fix_object_motion_vector->value(); };
@@ -1026,6 +1029,7 @@ private:
     const ModSlider::Ptr m_sharpness{ModSlider::create(generate_name("AFW_Sharpness"), 0.0f, 1.0f, 0.6f)};
     const ModToggle::Ptr m_framewarp_debug{ModToggle::create(generate_name("AFW_FramewarpDebug"), false)};
     const ModSlider::Ptr m_ignore_motion_threshold{ModSlider::create(generate_name("AFW_IgnoreMotionThreshold"), 0.1f, 100.0f, 2.5f)};
+    const ModToggle::Ptr m_di2_canonical_velocity{ModToggle::create(generate_name("AFW_DI2CanonicalVelocity"), true)};
     const ModCombo::Ptr m_framewarp_mode{ModCombo::create(generate_name("AFW_FramewarpMode"),
         {
             "None",
@@ -1246,6 +1250,8 @@ public:
             *m_framewarp_mode,
             *m_fix_object_motion_vector,
             *m_fix_object_motion_range,
+            *m_ignore_motion_threshold,
+            *m_di2_canonical_velocity,
             *m_ultra_responsive,
             *m_fix_moving_object_brightness_flickering,
             *m_enable_sharpening,
