@@ -196,7 +196,9 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
             vr->rawMVDesc[nEye].pTexture == barrier.Transition.pResource)
             continue;
         auto desc = barrier.Transition.pResource->GetDesc();
-        if (desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
+        // Dead Island 2 uses a two-channel UNORM texture for Unreal velocity.
+        if (desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM ||
+            desc.Format == DXGI_FORMAT_R16G16_UNORM) {
             if ((barrier.Transition.StateAfter & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE &&
                 (barrier.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET || barrier.Transition.StateBefore == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE)) {
                 if ((desc.Width == vr->renderSize[0] || vr->renderSize[0] == 0) &&
