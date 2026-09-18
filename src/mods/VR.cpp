@@ -320,26 +320,32 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
     // Unless there's no RHISubmissionThread
     auto threadID = std::this_thread::get_id();
     bool isRHIThread = RHIThreadID == threadID;
-    static bool skip = false;
+    static thread_local bool skip = false;
     if (!vr->is_using_afw() || skip)
         return;
     static int lastRHIThreadFoundFrame = 0;
     static int lastRHISubmissionThreadFoundFrame = 0;
 
     ID3D12Resource* velocityCandidate = nullptr;
-    D3D12_RESOURCE_STATES velocityCandidateState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    D3D12_RESOURCE_STATES velocityCandidateState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* motionVectorsCandidate = nullptr;
     auto render_frame_count = vr->get_render_frame_count();
     EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
     bool isNeverDLSS = vr->is_never_dlss();
     for (int i = 0; i < NumBarriers; i++) {
         auto& barrier = pBarriers[i];
-        if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !barrier.Transition.pResource || 
+        if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !barrier.Transition.pResource ||
+            barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
             vr->rawVelocityDesc[nEye].pTexture == barrier.Transition.pResource ||
             vr->rawVelocityRGDesc[nEye].pTexture == barrier.Transition.pResource ||
             vr->rawMVDesc[nEye].pTexture == barrier.Transition.pResource)
             continue;
         auto desc = barrier.Transition.pResource->GetDesc();
+        // The original call above already applied the complete barrier batch.
+        // A later transition supersedes an earlier candidate's final state.
+        if (velocityCandidate == barrier.Transition.pResource) {
+            velocityCandidate = nullptr;
+        }
         // Dead Island 2 uses a two-channel UNORM texture for Unreal velocity.
         if (desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM ||
             desc.Format == DXGI_FORMAT_R16G16_UNORM) {
@@ -381,8 +387,10 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
                 auto& captured = expand_velocity ? vr->rawVelocityRGDesc[nEye] : vr->rawVelocityDesc[nEye];
                 if (captured.pTexture == NULL || captured.pTexture->GetDesc().Width != desc.Width ||
                     captured.pTexture->GetDesc().Height != desc.Height || captured.pTexture->GetDesc().Format != desc.Format) {
-                    vr->d3d12Renderer->CreateTexture(
-                        desc.Width, desc.Height, desc.Format, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, captured, !expand_velocity);
+                    if (!vr->d3d12Renderer->CreateTexture(
+                        desc.Width, desc.Height, desc.Format, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, captured, !expand_velocity)) {
+                        return;
+                    }
                     if (expand_velocity && captured.pTexture != nullptr) {
                         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
                         srv.Format = desc.Format;
