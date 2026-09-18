@@ -1,6 +1,9 @@
 #define NOMINMAX
 
 #include <fstream>
+#include <array>
+#include <map>
+#include <mutex>
 
 #include <windows.h>
 #include <dbt.h>
@@ -35,6 +38,33 @@ bool is_dead_island_2_executable() {
     }();
     return detected;
 }
+
+std::mutex di2_ngx_history_mutex;
+
+struct DI2NGXHistory {
+    uint32_t eye_mask{};
+    uint64_t last_log_frame{};
+    uint64_t last_eye_frame[2]{};
+    const NVSDK_NGX_Parameter* creation_parameters{};
+    std::array<unsigned int, 6> creation_values{};
+    NVSDK_NGX_Handle* right_eye_handle{};
+    bool creation_valid{};
+    bool creation_attempted{};
+    bool was_afw{};
+    bool reset_eye[2]{};
+};
+
+std::map<const NVSDK_NGX_Handle*, DI2NGXHistory> di2_ngx_histories;
+constexpr std::array<const char*, 6> di2_ngx_creation_keys{
+    "Width", "Height", "OutWidth", "OutHeight", "PerfQualityValue", "DLSS.Feature.Create.Flags"};
+
+bool read_di2_ngx_creation(const NVSDK_NGX_Parameter* parameters, std::array<unsigned int, 6>& values) {
+    if (parameters == nullptr) return false;
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (parameters->Get(di2_ngx_creation_keys[index], &values[index]) != NVSDK_NGX_Result_Success) return false;
+    }
+    return values[0] != 0 && values[1] != 0 && values[2] != 0 && values[3] != 0;
+}
 }
 
 NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_CreateFeature(
@@ -42,9 +72,16 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_CreateFeature(
     spdlog::info("hk_NVSDK_NGX_D3D12_CreateFeature FeatureID {}", (int)InFeatureID);
     auto result = NVSDK_NGX_D3D12_CreateFeature_Hook.call<NVSDK_NGX_Result>(InCmdList, InFeatureID, InParameters, OutHandle);
     const auto& vr = VR::get();
-    int flag;
+    int flag{};
     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flag);
-    spdlog::info("hk_NVSDK_NGX_D3D12_CreateFeature 0x{0:x} flag:0x{0:x}", (INT64)result, (INT64)flag);
+    spdlog::info("hk_NVSDK_NGX_D3D12_CreateFeature 0x{:x} flag:0x{:x}", (INT64)result, (INT64)flag);
+    if (is_dead_island_2_executable() && InFeatureID == NVSDK_NGX_Feature_SuperSampling &&
+        result == NVSDK_NGX_Result_Success && OutHandle != nullptr && *OutHandle != nullptr) {
+        std::lock_guard lock{di2_ngx_history_mutex};
+        auto& history = di2_ngx_histories[*OutHandle];
+        history.creation_parameters = InParameters;
+        history.creation_valid = read_di2_ngx_creation(InParameters, history.creation_values);
+    }
     if ((InFeatureID != NVSDK_NGX_Feature_SuperSampling && InFeatureID != NVSDK_NGX_Feature_RayReconstruction)) {
         vr->vrNoneDLSSHandleMap[*OutHandle] = InFeatureID;
     }
@@ -52,6 +89,16 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_CreateFeature(
 }
 
 NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* InHandle) {
+    if (is_dead_island_2_executable()) {
+        std::lock_guard lock{di2_ngx_history_mutex};
+        const auto found = di2_ngx_histories.find(InHandle);
+        if (found != di2_ngx_histories.end() && found->second.right_eye_handle != nullptr) {
+            NVSDK_NGX_D3D12_ReleaseFeature_Hook.call<NVSDK_NGX_Result>(found->second.right_eye_handle);
+            SPDLOG_INFO("[DeadIsland2][NGX] Released independent right-eye temporal history {:x}",
+                reinterpret_cast<uintptr_t>(found->second.right_eye_handle));
+        }
+        di2_ngx_histories.erase(InHandle);
+    }
     spdlog::info("hk_NVSDK_NGX_D3D12_ReleaseFeature Starts");
     auto result = NVSDK_NGX_D3D12_ReleaseFeature_Hook.call<NVSDK_NGX_Result>(InHandle);
     spdlog::info("hk_NVSDK_NGX_D3D12_ReleaseFeature 0x{0:x}", (INT64)result);
@@ -65,6 +112,8 @@ static std::thread::id RHIThreadID = {};
 NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
     ID3D12GraphicsCommandList* InCmdList, const NVSDK_NGX_Handle* InFeatureHandle, NVSDK_NGX_Parameter* InParameters, void* InCallback) {
     const auto& vr = VR::get();
+    const NVSDK_NGX_Handle* evaluation_handle = InFeatureHandle;
+    bool reset_temporal_history = false;
     if (!vr->vrNoneDLSSHandleMap.contains((NVSDK_NGX_Handle*)InFeatureHandle)) {
         ID3D12Resource* color;
         ID3D12Resource* depth;
@@ -107,6 +156,59 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         auto render_frame_count = vr->get_render_frame_count();
         EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
         EyeIndex nEyeOther = (render_frame_count % 2 == 0) ? EyeRight : EyeLeft;
+        if (is_dead_island_2_executable() && InFeatureHandle != nullptr) {
+            std::lock_guard lock{di2_ngx_history_mutex};
+            auto& history = di2_ngx_histories[InFeatureHandle];
+            const bool afw = vr->is_using_afw();
+            if (history.was_afw != afw) {
+                history.eye_mask = 0;
+                history.last_eye_frame[0] = history.last_eye_frame[1] = 0;
+                history.reset_eye[0] = history.reset_eye[1] = history.right_eye_handle != nullptr;
+                history.was_afw = afw;
+            }
+            if (afw) {
+                const auto old_mask = history.eye_mask;
+                history.eye_mask |= 1u << static_cast<uint32_t>(nEye);
+                history.last_eye_frame[nEye] = render_frame_count;
+
+                // DI2 can reuse one temporal-upscaler context for alternating
+                // eyes. Give the right eye an independent history as soon as
+                // that shared use is observed.
+                if (history.eye_mask == 3 && history.last_eye_frame[0] != history.last_eye_frame[1] &&
+                    history.creation_valid && !history.creation_attempted) {
+                    history.creation_attempted = true;
+                    std::array<unsigned int, 6> current_creation{};
+                    if (history.creation_parameters == InParameters &&
+                        read_di2_ngx_creation(InParameters, current_creation) && current_creation == history.creation_values) {
+                        NVSDK_NGX_Handle* companion{};
+                        const auto created = NVSDK_NGX_D3D12_CreateFeature_Hook.call<NVSDK_NGX_Result>(
+                            InCmdList, NVSDK_NGX_Feature_SuperSampling, InParameters, &companion);
+                        if (created == NVSDK_NGX_Result_Success && companion != nullptr && companion != InFeatureHandle) {
+                            history.right_eye_handle = companion;
+                            history.reset_eye[0] = history.reset_eye[1] = true;
+                            SPDLOG_INFO("[DeadIsland2][NGX] Split temporal history left={:x} right={:x}",
+                                reinterpret_cast<uintptr_t>(InFeatureHandle), reinterpret_cast<uintptr_t>(companion));
+                        } else {
+                            SPDLOG_WARN("[DeadIsland2][NGX] Could not create independent right-eye history result={:x}", created);
+                        }
+                    } else {
+                        SPDLOG_WARN("[DeadIsland2][NGX] Shared history detected but creation parameters changed");
+                    }
+                }
+
+                if (history.right_eye_handle != nullptr) {
+                    evaluation_handle = nEye == EyeRight ? history.right_eye_handle : InFeatureHandle;
+                    reset_temporal_history = history.reset_eye[nEye];
+                    history.reset_eye[nEye] = false;
+                }
+                if (old_mask != history.eye_mask || render_frame_count - history.last_log_frame >= 1800) {
+                    SPDLOG_INFO("[DeadIsland2][NGX] history={:x} eye={} seen_eyes={} frame={}",
+                        reinterpret_cast<uintptr_t>(InFeatureHandle), static_cast<uint32_t>(nEye),
+                        history.eye_mask, render_frame_count);
+                    history.last_log_frame = render_frame_count;
+                }
+            }
+        }
         if (render_frame_count - vr->last_dlss_frame_count > 2)
             vr->dlss_continue_frame_count = 0;
         vr->last_dlss_frame_count = render_frame_count;
@@ -197,7 +299,13 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
     }
     if (!InFeatureHandle)
         return NVSDK_NGX_Result_Success;
-    auto result = NVSDK_NGX_D3D12_EvaluateFeature_Hook.call<NVSDK_NGX_Result>(InCmdList, InFeatureHandle, InParameters, InCallback);
+    int original_reset{};
+    if (reset_temporal_history) {
+        InParameters->Get("Reset", &original_reset);
+        InParameters->Set("Reset", 1);
+    }
+    auto result = NVSDK_NGX_D3D12_EvaluateFeature_Hook.call<NVSDK_NGX_Result>(InCmdList, evaluation_handle, InParameters, InCallback);
+    if (reset_temporal_history) InParameters->Set("Reset", original_reset);
     return result;
 }
 
